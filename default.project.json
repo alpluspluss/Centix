@@ -1,6 +1,12 @@
 {
   "name": "Centix",
   "tree": {
-    "$path": "lib"
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Centix": {
+        "$path": "lib"
+      }
+    }
   }
-}
+} 

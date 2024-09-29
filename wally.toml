@@ -1,0 +1,10 @@
+[package]
+name = "alpluspluss/centix"
+description = "ECS Package"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = ["alpluspluss"]
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]

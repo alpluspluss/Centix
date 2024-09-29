@@ -1,6 +1,6 @@
 {
-    "languageMode": "strict",
-    "lint": {
-        "*": false
-    }
+    "aliases": {
+        "centix": "lib"
+    },
+    "languageMode": "strict"
 }
