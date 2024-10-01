@@ -41,7 +41,7 @@ type Centix = typeof(setmetatable({
     _pendingTransitions = {} :: { { Entity: EntityId, Component: ComponentId, Add: boolean } }
 }, Centix))
 
-function Centix.New(): Centix
+function Centix.new(): Centix
     local self = setmetatable({}, Centix)
     self._archetypeIndex = {}
     self._entityIndex = {}
@@ -233,4 +233,4 @@ function Centix.HasComponent(self: Centix, entity: EntityId, component: Componen
 	return self._archetypeIndex[component] ~= nil and self._archetypeIndex[component]["entities"][entity] ~= nil
 end
 
-return Centix.New()
+return Centix.new()
