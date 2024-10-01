@@ -226,4 +226,11 @@ function Centix.RemoveComponent(self: Centix, entity: EntityId, component: Compo
     return self
 end
 
+function Centix.HasComponent(self: Centix, entity: EntityId, component: ComponentId): boolean
+	if not IsEntityValid(self, entity) then
+		error("[Centix]: Invalid entity reference", 0)
+	end	
+	return self._archetypeIndex[component] ~= nil and self._archetypeIndex[component]["entities"][entity] ~= nil
+end
+
 return Centix.New()
