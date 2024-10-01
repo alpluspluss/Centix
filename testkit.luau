@@ -297,7 +297,7 @@ local function FINISH(): boolean
 	return success, table.clear(tests)
 end
 
-local function SKIP(name: string)
+local function SKIP()
 	skip = true
 end
 
