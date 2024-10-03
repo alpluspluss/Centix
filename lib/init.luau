@@ -2,31 +2,8 @@
 --!optimize 2
 --!strict
 
-type SparseSet<T> = {
-    dense: { [number]: EntityId },
-    sparse: { [EntityId]: number },
-    data: { [number]: T },
-}
-
 type EntityId = number
 type ComponentId = number
-type ArchetypeId = number
-
-type Edge = {
-    fromArchetype: Archetype,
-    toArchetype: Archetype,
-    component: ComponentId
-}
-
-type Archetype = {
-    bitmask: number,
-    componentData: { [ComponentId]: SparseSet<any> },
-    entities: { [number]: EntityId },
-    addEdges: { [ComponentId]: Edge },
-    removeEdges: { [ComponentId]: Edge },
-    entityCount: number,
-    entityRow: { [EntityId]: number }
-}
 
 local ENTITY_MASK: number = 0x00FFFFFF
 local GENERATION_SHIFT: number = 0x18
@@ -34,12 +11,27 @@ local GENERATION_SHIFT: number = 0x18
 local Centix = {}
 Centix.__index = Centix
 
+type Storage<T> = {
+    dense: { [number]: EntityId },
+    sparse: { [EntityId]: number },
+    data: { [number]: T },
+}
+
+type RelationshipRegistry = {
+    nextId: number,
+    relationships: { [ComponentId]: string },
+}
+
+type RelationshipSet = Storage<{ [EntityId]: boolean }>
+
 type Centix = typeof(setmetatable({
-    _archetypeIndex = {} :: { [number]: Archetype },
-    _entityIndex = {} :: { [EntityId]: Archetype },
+    _archetypeIndex = {} :: { [number]: { [ComponentId]: any } },
+    _entityIndex = {} :: { [EntityId]: any },
     _freeList = {} :: { EntityId },
     _generations = {} :: { [EntityId]: number },
     _nextId = 1 :: EntityId,
+    _relationshipRegistry = { nextId = 1, relationships = {} } :: RelationshipRegistry,
+    _relationshipSets = {} :: { [ComponentId]: RelationshipSet }
 }, Centix))
 
 function Centix.new(): Centix
@@ -49,6 +41,8 @@ function Centix.new(): Centix
     self._freeList = {}
     self._generations = {}
     self._nextId = 1
+    self._relationshipRegistry = { nextId = 1, relationships = {} }
+    self._relationshipSets = {}
     return self
 end
 
@@ -80,18 +74,12 @@ function Centix.Despawn(self: Centix, encodedId: EntityId): ()
         archetype.entities[archetype.entityCount] = nil
         archetype.entityCount -= 1
 
-        for _, sparseSet in archetype.componentData do
-            if sparseSet then
-                local lastRow = archetype.entityCount + 1
-                sparseSet.dense[row] = sparseSet.dense[lastRow]
-                sparseSet.data[row] = sparseSet.data[lastRow]
-
-                local movedEntity = sparseSet.dense[row]
-                sparseSet.sparse[movedEntity] = row
-
-                sparseSet.dense[lastRow] = nil
-                sparseSet.data[lastRow] = nil
-            end
+        for _, componentArray in archetype.componentData do
+            local lastRow = archetype.entityCount + 1
+            componentArray[row] = componentArray[lastRow]
+            local movedEntity = archetype.entities[row]
+            archetype.entityRow[movedEntity] = row
+            componentArray[lastRow] = nil
         end
 
         archetype.entityRow[entityId] = nil
@@ -106,47 +94,29 @@ function Centix.Despawn(self: Centix, encodedId: EntityId): ()
     self._freeList[#self._freeList + 1] = entityId
 end
 
-local function __IsEntityValid(self: Centix, encodedId: EntityId): boolean
-    local entityId = bit32.band(encodedId, ENTITY_MASK)
-    local generation = bit32.rshift(encodedId, GENERATION_SHIFT)
-    return self._generations[entityId] == generation
-end
-
-local function ArchetypeTransition(self: Centix, entity: EntityId, component: ComponentId, add: boolean): Archetype
+local function __ArchetypeTransition(self: Centix, entity: EntityId, component: ComponentId, add: boolean): any
     local currentArchetype = self._entityIndex[entity]
-    local edgeTable = add and currentArchetype.addEdges or currentArchetype.removeEdges
-    local newArchetype: Archetype
-
-    local edge = edgeTable[component]
-    if edge then
-        return edge.toArchetype
-    end
-
     local newBitmask = add and bit32.bor(currentArchetype.bitmask, bit32.lshift(1, component - 1)) or
         bit32.band(currentArchetype.bitmask, bit32.bnot(bit32.lshift(1, component - 1)))
 
-    newArchetype = self._archetypeIndex[newBitmask]
+    local newArchetype = self._archetypeIndex[newBitmask]
     if not newArchetype then
         newArchetype = {
             bitmask = newBitmask,
             componentData = {},
             entities = {},
-            addEdges = {},
-            removeEdges = {},
             entityCount = 0,
             entityRow = {}
         }
         self._archetypeIndex[newBitmask] = newArchetype
     end
-
-    local newEdge = { fromArchetype = currentArchetype, toArchetype = newArchetype, component = component }
-    edgeTable[component] = newEdge
-
     return newArchetype
 end
 
 function Centix.RegisterComponent<T>(self: Centix, entity: EntityId, component: ComponentId, data: T): Centix
-    if not __IsEntityValid(self, entity) then
+    local entityId = bit32.band(entity, ENTITY_MASK)
+    local generation = bit32.rshift(entity, GENERATION_SHIFT)
+    if self._generations[entityId] ~= generation then
         error("[Centix]: Invalid entity reference", 0)
     end
 
@@ -156,31 +126,59 @@ function Centix.RegisterComponent<T>(self: Centix, entity: EntityId, component: 
             bitmask = 0,
             componentData = {},
             entities = {},
-            addEdges = {},
-            removeEdges = {},
             entityCount = 0,
             entityRow = {}
         }
         self._entityIndex[entity] = currentArchetype
     end
 
-    local sparseSet = currentArchetype.componentData[component]
-    if not sparseSet then
-        sparseSet = { dense = {}, sparse = {}, data = {} }
-        currentArchetype.componentData[component] = sparseSet
+    local componentArray = currentArchetype.componentData[component]
+    if not componentArray then
+        componentArray = {}
+        currentArchetype.componentData[component] = componentArray
     end
 
     local row = currentArchetype.entityRow[entity]
     if row then
-        sparseSet.data[row] = data
+        componentArray[row] = data
+    else
+        local newArchetype = __ArchetypeTransition(self, entity, component, true)
+        local newRow = newArchetype.entityCount + 1
+        componentArray[newRow] = data
+        newArchetype.entities[newRow] = entity
+        newArchetype.entityRow[entity] = newRow
+        newArchetype.entityCount += 1
+        self._entityIndex[entity] = newArchetype
+    end
+
+    return self
+end
+
+function Centix.RemoveComponent(self: Centix, entity: EntityId, component: ComponentId): Centix
+    local entityId = bit32.band(entity, ENTITY_MASK)
+    local generation = bit32.rshift(entity, GENERATION_SHIFT)
+    if self._generations[entityId] ~= generation then
+        error("[Centix]: Invalid entity reference", 0)
+    end
+
+    local currentArchetype = self._entityIndex[entity]
+    local componentArray = currentArchetype.componentData[component]
+    local row = currentArchetype.entityRow[entity]
+    if not row then
         return self
     end
 
-    local newArchetype = ArchetypeTransition(self, entity, component, true)
+    local lastRow = currentArchetype.entityCount
+    componentArray[row] = componentArray[lastRow]
+
+    local movedEntity = currentArchetype.entities[row]
+    currentArchetype.entityRow[movedEntity] = row
+
+    componentArray[lastRow] = nil
+    currentArchetype.entityCount -= 1
+
+    local newArchetype = __ArchetypeTransition(self, entity, component, false)
     local newRow = newArchetype.entityCount + 1
-    sparseSet.dense[newRow] = entity
-    sparseSet.sparse[entity] = newRow
-    sparseSet.data[newRow] = data
     newArchetype.entities[newRow] = entity
     newArchetype.entityRow[entity] = newRow
     newArchetype.entityCount += 1
@@ -189,39 +187,68 @@ function Centix.RegisterComponent<T>(self: Centix, entity: EntityId, component: 
     return self
 end
 
-function Centix.RemoveComponent(self: Centix, entity: EntityId, component: ComponentId): Centix
-    if not __IsEntityValid(self, entity) then
-        error("[Centix]: Invalid entity reference", 0)
+function Centix.RegisterRelationship(self: Centix, name: string): ComponentId
+    local relationshipId = self._relationshipRegistry.nextId
+    self._relationshipRegistry.relationships[relationshipId] = name
+    self._relationshipRegistry.nextId += 1
+    self._relationshipSets[relationshipId] = { dense = {}, sparse = {}, data = {} }
+    return relationshipId
+end
+
+function Centix.AddRelationship(self: Centix, entity1: EntityId, entity2: EntityId, relationshipType: ComponentId): Centix
+    local sparseSet = self._relationshipSets[relationshipType]
+    if not sparseSet then
+        error("[Centix]: Invalid relationship type", 0)
     end
 
-    local currentArchetype = self._entityIndex[entity]
-    local sparseSet = currentArchetype.componentData[component]
-    local row = sparseSet.sparse[entity]
+    local row = sparseSet.sparse[entity1] :: any
     if not row then
-        return self
+        row = #sparseSet.dense + 1
+        sparseSet.dense[row] = entity1
+        sparseSet.sparse[entity1] = row
+        sparseSet.data[row] = {}
+    end
+    sparseSet.data[row][entity2] = true
+    return self
+end
+
+function Centix.RemoveRelationship(self: Centix, entity1: EntityId, entity2: EntityId, relationshipType: ComponentId): Centix
+    local sparseSet = self._relationshipSets[relationshipType]
+    if not sparseSet then
+        error("[Centix]: Invalid relationship type", 0)
     end
 
-    local lastRow = currentArchetype.entityCount
-    sparseSet.dense[row] = sparseSet.dense[lastRow]
-    sparseSet.data[row] = sparseSet.data[lastRow]
+    local row = sparseSet.sparse[entity1]
+    if row then
+        sparseSet.data[row][entity2] = nil
 
-    local movedEntity = sparseSet.dense[row]
-    sparseSet.sparse[movedEntity] = row
-
-    sparseSet.dense[lastRow] = nil
-    sparseSet.data[lastRow] = nil
-    sparseSet.sparse[entity] = nil
-
-    currentArchetype.entityCount -= 1
-
-    local newArchetype = ArchetypeTransition(self, entity, component, false)
-    row = newArchetype.entityCount + 1
-    newArchetype.entities[row] = entity
-    newArchetype.entityRow[entity] = row
-    newArchetype.entityCount += 1
-
-    self._entityIndex[entity] = newArchetype
+        if next(sparseSet.data[row]) == nil then
+            local lastRow = #sparseSet.dense
+            if row ~= lastRow then
+                sparseSet.dense[row] = sparseSet.dense[lastRow]
+                sparseSet.data[row] = sparseSet.data[lastRow]
+                local movedEntity = sparseSet.dense[row]
+                sparseSet.sparse[movedEntity] = row
+            end
+            sparseSet.dense[lastRow] = nil
+            sparseSet.data[lastRow] = nil
+            sparseSet.sparse[entity1] = nil
+        end
+    end
     return self
+end
+
+function Centix.GetRelationships(self: Centix, entity: EntityId, relationshipType: ComponentId): { [EntityId]: boolean }
+    local sparseSet = self._relationshipSets[relationshipType]
+    if not sparseSet then
+        error("[Centix]: Invalid relationship type", 0)
+    end
+
+    local row = sparseSet.sparse[entity]
+    if row then
+        return sparseSet.data[row]
+    end
+    return {}
 end
 
 return Centix.new()
