@@ -176,7 +176,7 @@ local function __ArchetypeTransition__(self: Centix, entity: EntityId, component
 	return newArchetype
 end
 
-function Centix.RegisterComponent<T>(self: Centix, entity: EntityId, component: ComponentId, data: T): Centix
+function Centix.Register<T>(self: Centix, entity: EntityId, component: ComponentId, data: T): Centix
 	local entityId = bit32.band(entity, ENTITY_MASK)
 	local generation = bit32.rshift(entity, GENERATION_SHIFT)
 	if self._generations[entityId] ~= generation then
@@ -228,6 +228,57 @@ function Centix.RegisterComponent<T>(self: Centix, entity: EntityId, component: 
 
 		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_ADDITION)
 		newArchetype.dirtyFlags = bit32.bor(newArchetype.dirtyFlags, DIRTY_UPDATE)
+	end
+
+	return self
+end
+
+function Centix.Remove(self: Centix, entity: EntityId, componentIds: { ComponentId }): Centix
+	local entityId = bit32.band(entity, ENTITY_MASK)
+	local generation = bit32.rshift(entity, GENERATION_SHIFT)
+
+	if self._generations[entityId] ~= generation then
+		error("[Centix]: Invalid entity reference", 0)
+	end
+
+	local currentArchetype = self._entityIndex[entity]
+	if not currentArchetype then
+		error("[Centix]: Entity not initialized with an archetype", 0)
+	end
+
+	local newBitmask = currentArchetype.bitmask
+	for _, component in ipairs(componentIds) do
+		if not currentArchetype.componentData[component] then
+			error(("[Centix]: Component %d not found on entity"):format(component), 0)
+		end
+		newBitmask = bit32.band(newBitmask, bit32.bnot(bit32.lshift(1, component - 1)))
+	end
+
+	for _, component in componentIds do
+		local componentArray = currentArchetype.componentData[component]
+		local row = currentArchetype.entityRow[entity]
+
+		if row < currentArchetype.entityCount then
+			local lastEntity = currentArchetype.entities[currentArchetype.entityCount]
+			currentArchetype.entities[row] = lastEntity
+			currentArchetype.entityRow[lastEntity] = row
+		end
+
+		currentArchetype.entityCount -= 1
+
+		componentArray[row] = componentArray[currentArchetype.entityCount + 1]
+		componentArray[currentArchetype.entityCount + 1] = nil
+		currentArchetype.entityRow[entity] = nil
+
+		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_UPDATE)
+		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_REMOVAL)
+	end
+
+	local newArchetype = __ArchetypeTransition__(self, entity, newBitmask, false)
+	self._entityIndex[entity] = newArchetype
+
+	if currentArchetype.entityCount == 0 then
+		self._archetypeIndex[currentArchetype.bitmask] = nil
 	end
 
 	return self
