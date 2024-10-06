@@ -12,22 +12,22 @@ type Archetype = {
 	entityCount: number,
 	dirtyFlags: number
 }
-type GraphEdge = {
-	from: Archetype,
-	to: Archetype,
-	componentId: ComponentId
-}
+
 type ArchetypeEdgeCache = {
-	[number]: { 
-		[number]: GraphEdge 
+	[number]: { -- Flattened edge cache with combined bitmasks as keys
+		to: Archetype,
+		componentId: ComponentId
 	}
 }
+
 type QueryCache = {
 	archetypes: { Archetype },
 	includeBitmask: number,
 	excludeBitmask: number,
 	components: { ComponentId }
 }
+
+local Signal = require(script:WaitForChild("Signal"))
 
 local ENTITY_MASK: number = 0x00FFFFFF
 local GENERATION_SHIFT: number = 0x18
@@ -49,6 +49,10 @@ type Centix = typeof(setmetatable({
 	_edgeCache = {} :: ArchetypeEdgeCache,
 	_queryCache = {} :: { [number]: QueryObject },
 	_previousSnapshots = {} :: { [Archetype]: { entityCount: number, componentHash: number } },
+	OnAdded = Signal.new(),
+	OnSet = Signal.new(),
+	OnRemoved = Signal.new(),
+	OnTransitioned = Signal.new()
 }, Centix))
 
 function Centix.new(): Centix
@@ -61,6 +65,10 @@ function Centix.new(): Centix
 	self._edgeCache = {}
 	self._queryCache = {}
 	self._previousSnapshots = {}
+	self.OnAdded = Signal.new()
+	self.OnRemoved = Signal.new()
+	self.OnSet = Signal.new()
+	self.OnTransitioned = Signal.new()
 	return self
 end
 
@@ -79,7 +87,6 @@ function Centix.Spawn(self: Centix): EntityId
 		self._nextId += 1
 		generation = 0
 	end
-
 	self._generations[entityId] = generation
 	return bit32.bor(bit32.lshift(generation, GENERATION_SHIFT), entityId)
 end
@@ -114,8 +121,9 @@ function Centix.Despawn(self: Centix, encodedId: EntityId): ()
 
 		archetype.dirtyFlags = bit32.bor(archetype.dirtyFlags, DIRTY_REMOVAL)
 	end
-
+	
 	self._freeList[#self._freeList + 1] = entityId
+	self.OnRemoved:Fire(entityId)
 end
 
 local function __Archetype__Transition__(self: Centix, entity: EntityId, component: ComponentId, add: boolean): Archetype
@@ -124,12 +132,14 @@ local function __Archetype__Transition__(self: Centix, entity: EntityId, compone
 		error("[Centix]: Entity not initialized with an archetype", 0)
 	end
 
-	local newBitmask = add and bit32.bor(currentArchetype.bitmask, bit32.lshift(1, component - 1))
-		or bit32.band(currentArchetype.bitmask, bit32.bnot(bit32.lshift(1, component - 1)))
+	local shiftComponent = bit32.lshift(1, component - 1)
+	local newBitmask = add and bit32.bor(currentArchetype.bitmask, shiftComponent)
+		or bit32.band(currentArchetype.bitmask, bit32.bnot(shiftComponent))
 
-	local edgeCache = self._edgeCache[currentArchetype.bitmask]
-	if edgeCache and edgeCache[newBitmask] then
-		return edgeCache[newBitmask].to
+	local cacheKey = bit32.bor(bit32.lshift(currentArchetype.bitmask, 32), newBitmask)
+	local cachedEdge = self._edgeCache[cacheKey]
+	if cachedEdge then
+		return cachedEdge.to
 	end
 
 	local newArchetype = self._archetypeIndex[newBitmask]
@@ -140,19 +150,19 @@ local function __Archetype__Transition__(self: Centix, entity: EntityId, compone
 			entities = {},
 			entityRow = {},
 			entityCount = 0,
-			dirtyFlags = DIRTY_ADDITION,
+			dirtyFlags = DIRTY_ADDITION
 		}
 		self._archetypeIndex[newBitmask] = newArchetype
 	end
 
-	self._edgeCache[currentArchetype.bitmask] = self._edgeCache[currentArchetype.bitmask] or {}
-	self._edgeCache[currentArchetype.bitmask][newBitmask] = {
-		from = currentArchetype,
+	self._edgeCache[cacheKey] = {
 		to = newArchetype,
 		componentId = component,
 	}
 
-	currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_UPDATE)
+	if bit32.band(currentArchetype.dirtyFlags, DIRTY_UPDATE) == 0 then
+		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_UPDATE)
+	end
 	return newArchetype
 end
 
@@ -178,7 +188,6 @@ function Centix.Set<T>(self: Centix, entity: EntityId, component: ComponentId, d
 	end
 
 	local row = currentArchetype.entityRow[entity]
-
 	local newBitmask = bit32.bor(currentArchetype.bitmask, bit32.lshift(1, component - 1))
 	if row and newBitmask == currentArchetype.bitmask then
 		local componentArray = currentArchetype.componentData[component]
@@ -193,13 +202,12 @@ function Centix.Set<T>(self: Centix, entity: EntityId, component: ComponentId, d
 		local newArchetype = __Archetype__Transition__(self, entity, component, true)
 
 		newArchetype.bitmask = newBitmask
-
 		local newRow = newArchetype.entityCount + 1
 		newArchetype.entities[newRow] = entity
 		newArchetype.entityRow[entity] = newRow
 		newArchetype.entityCount += 1
 
-		for compId, compData in pairs(currentArchetype.componentData) do
+		for compId, compData in currentArchetype.componentData do
 			local oldArray = compData
 			local oldRow = currentArchetype.entityRow[entity]
 			if not newArchetype.componentData[compId] then
@@ -218,15 +226,62 @@ function Centix.Set<T>(self: Centix, entity: EntityId, component: ComponentId, d
 		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_UPDATE)
 		newArchetype.dirtyFlags = bit32.bor(newArchetype.dirtyFlags, DIRTY_ADDITION)
 	end
-
+	self.OnAdded:Fire(entity, component)
 	return self
+end
+
+function Centix.Remove(self: Centix, entity: EntityId, component: ComponentId): Centix
+    local entityId = bit32.band(entity, ENTITY_MASK)
+    local generation = bit32.rshift(entity, GENERATION_SHIFT)
+
+    if self._generations[entityId] ~= generation then
+        error("[Centix]: Invalid entity reference", 0)
+    end
+
+    local currentArchetype = self._entityIndex[entity]
+    if not currentArchetype then
+        error("[Centix]: Entity does not exist in any archetype", 0)
+    end
+    if not currentArchetype.componentData[component] then
+        return self
+    end
+    local shiftComponent = bit32.lshift(1, component - 1)
+    local newBitmask = bit32.band(currentArchetype.bitmask, bit32.bnot(shiftComponent))
+    if newBitmask == currentArchetype.bitmask then
+        return self
+    end
+    local row = currentArchetype.entityRow[entity]
+    currentArchetype.componentData[component][row] = nil
+
+    local newArchetype = __Archetype__Transition__(self, entity, component, false)
+
+    newArchetype.bitmask = newBitmask
+    local newRow = newArchetype.entityCount + 1
+    newArchetype.entities[newRow] = entity
+    newArchetype.entityRow[entity] = newRow
+    newArchetype.entityCount += 1
+
+    for compId, compData in currentArchetype.componentData do
+        local oldArray = compData
+        local oldRow = currentArchetype.entityRow[entity]
+        if not newArchetype.componentData[compId] then
+            newArchetype.componentData[compId] = {}
+        end
+        newArchetype.componentData[compId][newRow] = oldArray[oldRow]
+    end
+
+    self._entityIndex[entity] = newArchetype
+    currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_REMOVAL)
+    newArchetype.dirtyFlags = bit32.bor(newArchetype.dirtyFlags, DIRTY_ADDITION)
+	self.OnAdded:Fire(entity, component)
+    return self
 end
 
 local querySchema = {
 	archetypes = {} :: { Archetype },
 	components = {} :: { ComponentId },
-	includeBitmask = 0,
-	excludeBitmask = 0,
+	includeBitmask = 0 :: number,
+	excludeBitmask = 0 :: number,
 	ecs = Centix.new()
 }
 
@@ -260,50 +315,55 @@ function QueryObject.Exclude(self: QueryObject, componentIds: { ComponentId }): 
 end
 
 function QueryObject.View(self: QueryObject): () -> (EntityId, ...any)?
-	local currentArchetypeIndex = 1
-	local currentEntityIndex = 1
-	local currentArchetype = self.archetypes[currentArchetypeIndex]
+    local currentArchetypeIndex = 1
+    local currentEntityIndex = 1
+    local currentArchetype = self.archetypes[currentArchetypeIndex]
 
-	return function(): (EntityId, ...any)?
-		while currentArchetype do
-			if currentArchetype.dirtyFlags == 0 then
-				currentArchetypeIndex += 1
-				currentArchetype = self.archetypes[currentArchetypeIndex]
-				currentEntityIndex = 1
-				continue
-			end
+    local componentArrays = {}
+    local numComponents = #self.components
+    
+    return function(): (EntityId, ...any)?
+        while currentArchetype do
+            if currentArchetype.entityCount == 0 then
+                currentArchetypeIndex += 1
+                currentArchetype = self.archetypes[currentArchetypeIndex]
+                currentEntityIndex = 1
+                continue
+            end
 
-			if currentEntityIndex > currentArchetype.entityCount then
-				currentArchetypeIndex += 1
-				currentArchetype = self.archetypes[currentArchetypeIndex]
-				currentEntityIndex = 1
-			else
-				local entityId = currentArchetype.entities[currentEntityIndex]
-				currentEntityIndex += 1
-
-				if bit32.band(currentArchetype.bitmask, self.includeBitmask) == self.includeBitmask and
-					bit32.band(currentArchetype.bitmask, self.excludeBitmask) == 0 then
-					local componentValues = {}
-					for _, componentId in self.components do
-						local componentArray = currentArchetype.componentData[componentId]
-						if componentArray then
-							local row = currentArchetype.entityRow[entityId]
-							componentValues[#componentValues + 1] = componentArray[row]
-						else
-							componentValues[#componentValues + 1] = nil
-						end
-					end
-					return entityId, table.unpack(componentValues)
-				end
-			end
-		end
-
-		return nil
-	end
+            if bit32.band(currentArchetype.bitmask, self.includeBitmask) == self.includeBitmask and
+               bit32.band(currentArchetype.bitmask, self.excludeBitmask) == 0 then
+                for _, componentId in self.components do
+                    componentArrays[componentId] = currentArchetype.componentData[componentId]
+                end
+                while currentEntityIndex <= currentArchetype.entityCount do
+                    local entityId = currentArchetype.entities[currentEntityIndex]
+                    currentEntityIndex += 1
+                    local componentValues = table.create(numComponents)
+                    for i, componentId in self.components do
+                        local componentArray = componentArrays[componentId]
+                        if componentArray then
+                            local row = currentArchetype.entityRow[entityId]
+                            componentValues[i] = componentArray[row]
+                        else
+                            componentValues[i] = nil
+                        end
+                    end
+                    return entityId, table.unpack(componentValues)
+                end
+                currentArchetype.dirtyFlags = 0
+            end
+            currentArchetypeIndex += 1
+            currentArchetype = self.archetypes[currentArchetypeIndex]
+            currentEntityIndex = 1
+        end
+        return nil
+    end
 end
 
 function Centix.Query(self: Centix, components: { ComponentId }): QueryObject
 	local queryBitmask = 0
+	-- TODO: Optimize this
 	for _, componentId in components do
 		queryBitmask = bit32.bor(queryBitmask, bit32.lshift(1, componentId - 1))
 	end

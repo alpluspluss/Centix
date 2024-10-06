@@ -1,1 +1,1 @@
-{"name":"Centix","className":"DataModel","filePaths":["default.project.json"],"children":[{"name":"ReplicatedStorage","className":"ReplicatedStorage","children":[{"name":"Centix","className":"ModuleScript","filePaths":["lib/init.luau"]}]}]}
+{"name":"Centix","className":"DataModel","filePaths":["default.project.json"],"children":[{"name":"ReplicatedStorage","className":"ReplicatedStorage","children":[{"name":"Centix","className":"ModuleScript","filePaths":["lib/init.luau"],"children":[{"name":"Signal","className":"ModuleScript","filePaths":["lib/Signal.luau"]}]}]}]}
