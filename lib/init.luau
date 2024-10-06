@@ -29,13 +29,6 @@ type QueryCache = {
 	components: { ComponentId }
 }
 
-local querySchema = {
-	archetypes = {} :: { Archetype },
-	components = {} :: { ComponentId },
-	includeBitmask = 0,
-	excludeBitmask = 0
-}
-
 local ENTITY_MASK: number = 0x00FFFFFF
 local GENERATION_SHIFT: number = 0x18
 local MAX_GENERATION: number = 0xFF
@@ -55,7 +48,6 @@ type Centix = typeof(setmetatable({
 	_nextId = 1 :: EntityId,
 	_edgeCache = {} :: ArchetypeEdgeCache,
 	_queryCache = {} :: { [number]: QueryObject },
-	_dirtyArchetypes = {} :: { [number]: boolean },
 	_previousSnapshots = {} :: { [Archetype]: { entityCount: number, componentHash: number } },
 }, Centix))
 
@@ -68,12 +60,11 @@ function Centix.new(): Centix
 	self._nextId = 1
 	self._edgeCache = {}
 	self._queryCache = {}
-	self._dirtyArchetypes = {}
 	self._previousSnapshots = {}
 	return self
 end
 
-function Centix.Entity(self: Centix): EntityId
+function Centix.Spawn(self: Centix): EntityId
 	local entityId: EntityId
 	local generation: number
 
@@ -127,24 +118,18 @@ function Centix.Despawn(self: Centix, encodedId: EntityId): ()
 	self._freeList[#self._freeList + 1] = entityId
 end
 
-local function __ArchetypeTransition__(self: Centix, entity: EntityId, component: ComponentId, add: boolean): Archetype
+local function __Archetype__Transition__(self: Centix, entity: EntityId, component: ComponentId, add: boolean): Archetype
 	local currentArchetype = self._entityIndex[entity]
 	if not currentArchetype then
 		error("[Centix]: Entity not initialized with an archetype", 0)
 	end
 
-	local newBitmask = add and bit32.bor(currentArchetype.bitmask, bit32.lshift(1, component - 1)) or
-		bit32.band(currentArchetype.bitmask, bit32.bnot(bit32.lshift(1, component - 1)))
+	local newBitmask = add and bit32.bor(currentArchetype.bitmask, bit32.lshift(1, component - 1))
+		or bit32.band(currentArchetype.bitmask, bit32.bnot(bit32.lshift(1, component - 1)))
 
 	local edgeCache = self._edgeCache[currentArchetype.bitmask]
 	if edgeCache and edgeCache[newBitmask] then
 		return edgeCache[newBitmask].to
-	end
-
-	for bitmask, archetype in self._archetypeIndex do
-		if bit32.band(bitmask, newBitmask) == newBitmask then
-			return archetype
-		end
 	end
 
 	local newArchetype = self._archetypeIndex[newBitmask]
@@ -153,17 +138,14 @@ local function __ArchetypeTransition__(self: Centix, entity: EntityId, component
 			bitmask = newBitmask,
 			componentData = {},
 			entities = {},
-			entityCount = 0,
 			entityRow = {},
-			dirtyFlags = 0,
+			entityCount = 0,
+			dirtyFlags = DIRTY_ADDITION,
 		}
 		self._archetypeIndex[newBitmask] = newArchetype
 	end
 
-	if not self._edgeCache[currentArchetype.bitmask] then
-		self._edgeCache[currentArchetype.bitmask] = {}
-	end
-
+	self._edgeCache[currentArchetype.bitmask] = self._edgeCache[currentArchetype.bitmask] or {}
 	self._edgeCache[currentArchetype.bitmask][newBitmask] = {
 		from = currentArchetype,
 		to = newArchetype,
@@ -171,14 +153,13 @@ local function __ArchetypeTransition__(self: Centix, entity: EntityId, component
 	}
 
 	currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_UPDATE)
-	newArchetype.dirtyFlags = bit32.bor(newArchetype.dirtyFlags, DIRTY_ADDITION)
-
 	return newArchetype
 end
 
-function Centix.Register<T>(self: Centix, entity: EntityId, component: ComponentId, data: T): Centix
+function Centix.Set<T>(self: Centix, entity: EntityId, component: ComponentId, data: T): Centix
 	local entityId = bit32.band(entity, ENTITY_MASK)
 	local generation = bit32.rshift(entity, GENERATION_SHIFT)
+
 	if self._generations[entityId] ~= generation then
 		error("[Centix]: Invalid entity reference", 0)
 	end
@@ -197,21 +178,28 @@ function Centix.Register<T>(self: Centix, entity: EntityId, component: Component
 	end
 
 	local row = currentArchetype.entityRow[entity]
-	if row then
+
+	local newBitmask = bit32.bor(currentArchetype.bitmask, bit32.lshift(1, component - 1))
+	if row and newBitmask == currentArchetype.bitmask then
 		local componentArray = currentArchetype.componentData[component]
 		if not componentArray then
 			componentArray = {}
 			currentArchetype.componentData[component] = componentArray
 		end
 		componentArray[row] = data
+
+		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_UPDATE)
 	else
-		local newArchetype = __ArchetypeTransition__(self, entity, component, true)
+		local newArchetype = __Archetype__Transition__(self, entity, component, true)
+
+		newArchetype.bitmask = newBitmask
+
 		local newRow = newArchetype.entityCount + 1
 		newArchetype.entities[newRow] = entity
 		newArchetype.entityRow[entity] = newRow
 		newArchetype.entityCount += 1
 
-		for compId, compData in currentArchetype.componentData do
+		for compId, compData in pairs(currentArchetype.componentData) do
 			local oldArray = compData
 			local oldRow = currentArchetype.entityRow[entity]
 			if not newArchetype.componentData[compId] then
@@ -224,65 +212,23 @@ function Centix.Register<T>(self: Centix, entity: EntityId, component: Component
 			newArchetype.componentData[component] = {}
 		end
 		newArchetype.componentData[component][newRow] = data
+
 		self._entityIndex[entity] = newArchetype
 
-		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_ADDITION)
-		newArchetype.dirtyFlags = bit32.bor(newArchetype.dirtyFlags, DIRTY_UPDATE)
-	end
-
-	return self
-end
-
-function Centix.Remove(self: Centix, entity: EntityId, componentIds: { ComponentId }): Centix
-	local entityId = bit32.band(entity, ENTITY_MASK)
-	local generation = bit32.rshift(entity, GENERATION_SHIFT)
-
-	if self._generations[entityId] ~= generation then
-		error("[Centix]: Invalid entity reference", 0)
-	end
-
-	local currentArchetype = self._entityIndex[entity]
-	if not currentArchetype then
-		error("[Centix]: Entity not initialized with an archetype", 0)
-	end
-
-	local newBitmask = currentArchetype.bitmask
-	for _, component in ipairs(componentIds) do
-		if not currentArchetype.componentData[component] then
-			error(("[Centix]: Component %d not found on entity"):format(component), 0)
-		end
-		newBitmask = bit32.band(newBitmask, bit32.bnot(bit32.lshift(1, component - 1)))
-	end
-
-	for _, component in componentIds do
-		local componentArray = currentArchetype.componentData[component]
-		local row = currentArchetype.entityRow[entity]
-
-		if row < currentArchetype.entityCount then
-			local lastEntity = currentArchetype.entities[currentArchetype.entityCount]
-			currentArchetype.entities[row] = lastEntity
-			currentArchetype.entityRow[lastEntity] = row
-		end
-
-		currentArchetype.entityCount -= 1
-
-		componentArray[row] = componentArray[currentArchetype.entityCount + 1]
-		componentArray[currentArchetype.entityCount + 1] = nil
-		currentArchetype.entityRow[entity] = nil
-
 		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_UPDATE)
-		currentArchetype.dirtyFlags = bit32.bor(currentArchetype.dirtyFlags, DIRTY_REMOVAL)
-	end
-
-	local newArchetype = __ArchetypeTransition__(self, entity, newBitmask, false)
-	self._entityIndex[entity] = newArchetype
-
-	if currentArchetype.entityCount == 0 then
-		self._archetypeIndex[currentArchetype.bitmask] = nil
+		newArchetype.dirtyFlags = bit32.bor(newArchetype.dirtyFlags, DIRTY_ADDITION)
 	end
 
 	return self
 end
+
+local querySchema = {
+	archetypes = {} :: { Archetype },
+	components = {} :: { ComponentId },
+	includeBitmask = 0,
+	excludeBitmask = 0,
+	ecs = Centix.new()
+}
 
 local QueryObject = {}
 QueryObject.__index = QueryObject
@@ -295,6 +241,7 @@ function QueryObject.new(q: typeof(querySchema)): QueryObject
 	self.components = q.components
 	self.includeBitmask = q.includeBitmask
 	self.excludeBitmask = q.excludeBitmask
+	self.ecs = q.ecs
 	return self
 end
 
@@ -312,14 +259,14 @@ function QueryObject.Exclude(self: QueryObject, componentIds: { ComponentId }): 
 	return self
 end
 
-function QueryObject.View(self: QueryObject, centix: Centix): () -> (EntityId, ...any)?
+function QueryObject.View(self: QueryObject): () -> (EntityId, ...any)?
 	local currentArchetypeIndex = 1
 	local currentEntityIndex = 1
 	local currentArchetype = self.archetypes[currentArchetypeIndex]
 
 	return function(): (EntityId, ...any)?
 		while currentArchetype do
-			if not centix._dirtyArchetypes[currentArchetype.bitmask] then
+			if currentArchetype.dirtyFlags == 0 then
 				currentArchetypeIndex += 1
 				currentArchetype = self.archetypes[currentArchetypeIndex]
 				currentEntityIndex = 1
@@ -350,6 +297,7 @@ function QueryObject.View(self: QueryObject, centix: Centix): () -> (EntityId, .
 				end
 			end
 		end
+
 		return nil
 	end
 end
@@ -363,27 +311,9 @@ function Centix.Query(self: Centix, components: { ComponentId }): QueryObject
 	if self._queryCache[queryBitmask] then
 		local cachedQuery = self._queryCache[queryBitmask]
 		local isValid = true
-		
+
 		for _, archetype in cachedQuery.archetypes do
-			local prevSnapshot = self._previousSnapshots[archetype]
-			if prevSnapshot then
-				if archetype.entityCount ~= prevSnapshot.entityCount then
-					isValid = false
-					break
-				end
-
-				local currentHash = 0
-				for _, componentArray in pairs(archetype.componentData) do
-					for i, value in ipairs(componentArray) do
-						currentHash = bit32.bxor(currentHash, bit32.bor(i, tostring(value):len()))
-					end
-				end
-
-				if currentHash ~= prevSnapshot.componentHash then
-					isValid = false
-					break
-				end
-			else
+			if bit32.band(archetype.dirtyFlags, DIRTY_UPDATE) ~= 0 then
 				isValid = false
 				break
 			end
@@ -396,21 +326,8 @@ function Centix.Query(self: Centix, components: { ComponentId }): QueryObject
 
 	local matchingArchetypes = {}
 	for bitmask, archetype in self._archetypeIndex do
-		if bit32.band(bitmask, queryBitmask) == queryBitmask then
+		if bit32.bor(bitmask, queryBitmask) == queryBitmask then
 			matchingArchetypes[#matchingArchetypes + 1] = archetype
-		end
-	end
-
-	for _, archetype in matchingArchetypes do
-		self._previousSnapshots[archetype] = {
-			entityCount = archetype.entityCount,
-			componentHash = 0,
-		}
-
-		for _, componentArray in archetype.componentData do
-			for i, value in componentArray do
-				self._previousSnapshots[archetype].componentHash = bit32.bxor(self._previousSnapshots[archetype].componentHash, bit32.bor(i, tostring(value):len()))
-			end
 		end
 	end
 
@@ -419,7 +336,9 @@ function Centix.Query(self: Centix, components: { ComponentId }): QueryObject
 		includeBitmask = queryBitmask,
 		excludeBitmask = 0,
 		components = components,
+		ecs = self
 	}
+
 	local queryObj = QueryObject.new(query)
 	self._queryCache[queryBitmask] = queryObj
 	return queryObj
